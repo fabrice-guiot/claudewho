@@ -231,6 +231,111 @@ WRAPPER_EOF
     chmod +x "$wrapper_path"
 }
 
+# Create a generic wrapper for an arbitrary command that shadows the real
+# binary on PATH and injects CLAUDE_CONFIG_DIR based on the current account.
+create_command_wrapper() {
+    local cmd="$1"
+    local wrapper_path="${WRAPPER_DIR}/${cmd}"
+
+    mkdir -p "$WRAPPER_DIR"
+
+    cat > "$wrapper_path" << WRAPPER_EOF
+#!/bin/bash
+# ${cmd} wrapper - managed by claudewho
+# Shadows the real ${cmd} binary on PATH and exports CLAUDE_CONFIG_DIR
+# based on the account selected via 'claudewho use <name>'.
+
+CURRENT_ACCOUNT_FILE="\$HOME/.claudewho-current-account"
+CONFIG_DIR_PREFIX="\$HOME/.claudewho-"
+WRAPPER_DIR="\$HOME/.local/bin"
+
+# Find the real ${cmd} binary on PATH, skipping our wrapper directory
+# to avoid recursing into ourselves.
+find_real_cmd() {
+    local IFS=':'
+    for dir in \$PATH; do
+        [[ "\$dir" == "\$WRAPPER_DIR" ]] && continue
+        if [[ -x "\$dir/${cmd}" ]]; then
+            echo "\$dir/${cmd}"
+            return 0
+        fi
+    done
+    echo "Error: Could not find real ${cmd} binary on PATH (excluding \$WRAPPER_DIR)." >&2
+    exit 1
+}
+
+if [[ -f "\$CURRENT_ACCOUNT_FILE" ]]; then
+    account=\$(cat "\$CURRENT_ACCOUNT_FILE" 2>/dev/null)
+    if [[ -n "\$account" ]]; then
+        export CLAUDE_CONFIG_DIR="\${CONFIG_DIR_PREFIX}\${account}"
+    fi
+fi
+
+real_cmd=\$(find_real_cmd)
+exec "\$real_cmd" "\$@"
+WRAPPER_EOF
+
+    chmod +x "$wrapper_path"
+}
+
+# Wrap an arbitrary command so it picks up the current claudewho account.
+wrap_command() {
+    local cmd="${1:-}"
+
+    if [[ -z "$cmd" ]]; then
+        echo -e "${RED}Error:${NC} Command name required"
+        echo "Usage: claudewho wrap <command>"
+        echo ""
+        echo "Example:"
+        echo "    claudewho wrap recall"
+        exit 1
+    fi
+
+    # Validate command name (same rules as account names, plus underscores/dots)
+    if [[ ! "$cmd" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        echo -e "${RED}Error:${NC} Invalid command name '$cmd'"
+        exit 1
+    fi
+
+    # Verify a real binary exists somewhere on PATH outside WRAPPER_DIR.
+    local found=""
+    local IFS=':'
+    for dir in $PATH; do
+        [[ "$dir" == "$WRAPPER_DIR" ]] && continue
+        if [[ -x "$dir/$cmd" ]]; then
+            found="$dir/$cmd"
+            break
+        fi
+    done
+    unset IFS
+
+    if [[ -z "$found" ]]; then
+        echo -e "${YELLOW}Warning:${NC} No real '$cmd' binary found on PATH (outside $WRAPPER_DIR)."
+        echo "The wrapper will be created, but will fail at runtime until '$cmd' is installed."
+        read -rp "Continue? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    create_command_wrapper "$cmd"
+
+    echo -e "${GREEN}Created${NC} ${WRAPPER_DIR}/${cmd}"
+    if [[ -n "$found" ]]; then
+        echo -e "  Shadows: ${DIM}${found}${NC}"
+    fi
+    echo ""
+    echo "Make sure ${WRAPPER_DIR} comes before $(dirname "${found:-/usr/local/bin}") in your PATH."
+    echo "Then '$cmd' will automatically use the account selected by 'claudewho use <name>'."
+
+    if ! check_path; then
+        echo ""
+        echo -e "${YELLOW}Note:${NC} ~/.local/bin is not in your PATH. Add it with:"
+        echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+    fi
+}
+
 # Show banner
 show_banner() {
     echo ""
@@ -253,6 +358,7 @@ usage() {
     echo "    add <name>          Create a new account configuration"
     echo "    remove <name>       Remove an account (with confirmation)"
     echo "    use <name>          Switch to an account"
+    echo "    wrap <command>      Create a wrapper that runs <command> under the current account"
     echo "    ide-setup           Configure IDE integration (VSCode)"
     echo "    shell-init          Print shell aliases (alternative to wrapper scripts)"
     echo "    version             Show version information"
@@ -599,6 +705,9 @@ main() {
             ;;
         use|run|launch)
             use_account "$@"
+            ;;
+        wrap)
+            wrap_command "$@"
             ;;
         ide-setup|ide|vscode-setup)
             ide_setup "$@"
