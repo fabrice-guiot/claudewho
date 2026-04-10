@@ -80,6 +80,16 @@ claudewho remove personal
 
 This will prompt for confirmation before deleting the account directory.
 
+### Wrap other commands
+
+If you use other Claude-aware tools (e.g. `recall`), you can wrap them so they automatically use the active claudewho account:
+
+```bash
+claudewho wrap recall
+```
+
+This creates a wrapper at `~/.local/bin/recall` that sets `CLAUDE_CONFIG_DIR` to the active account before running the real binary. Any tool wrapped this way will follow whichever account is selected via `claudewho use <name>`.
+
 ## Commands
 
 | Command | Description |
@@ -88,6 +98,7 @@ This will prompt for confirmation before deleting the account directory.
 | `add <name>` | Create a new account configuration |
 | `remove <name>` | Remove an account (with confirmation) |
 | `use <name>` | Switch to the specified account |
+| `wrap <command>` | Create a wrapper for a command to use the active account |
 | `ide-setup` | Configure IDE integration (VSCode) |
 | `shell-init` | Print shell aliases for sourcing |
 | `version` | Show version information |
