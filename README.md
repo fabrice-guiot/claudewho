@@ -101,6 +101,9 @@ This creates a wrapper at `~/.local/bin/recall` that sets `CLAUDE_CONFIG_DIR` to
 | `wrap <command>` | Create a wrapper for a command to use the active account |
 | `ide-setup` | Configure IDE integration (VSCode) |
 | `shell-init` | Print shell aliases for sourcing |
+| `keychain status` | Show Keychain state — bindings, suffixed CLI entries, stashes (macOS) |
+| `keychain bind <p> <suffix>` | Bind a profile to a `Claude Code-credentials-<suffix>` entry (macOS) |
+| `keychain unbind <p>` | Remove a profile's suffix binding (macOS) |
 | `version` | Show version information |
 | `help` | Show help message |
 
@@ -154,6 +157,62 @@ claudewho ide-setup --account work
 - Account names are tracked in `~/.claudewho.conf`
 - Wrapper scripts like `claudewho-work` are created in `~/.local/bin/` and set `CLAUDE_CONFIG_DIR` before launching Claude
 - Your original `~/.claude` directory is never modified
+
+### macOS credential isolation
+
+There are two different Claude Code clients with **different credential
+storage models** on macOS, and claudewho handles each one differently.
+
+**CLI (`claude` binary, v2.1.x)** stores OAuth credentials per account
+under `Claude Code-credentials-<8hex>` Keychain entries — one entry per
+authenticated Anthropic account. When you run `claude` under a given
+`CLAUDE_CONFIG_DIR`, it reads that profile's `.claude.json` and looks up
+the entry whose `accountUuid` matches. **Multi-account works natively** —
+you just need to log in once per profile so each gets its own entry.
+claudewho's only job for the CLI is to set `CLAUDE_CONFIG_DIR` to the
+right value via the per-account wrappers.
+
+**Desktop app / IDE extension** (VSCode `claude-code` extension, the
+Claude desktop app) uses the suffix-less `Claude Code-credentials` entry,
+which has no multi-account support. To switch identities in the IDE,
+claudewho stashes each profile's token under `Claude Code-credentials-<name>`
+and swaps it into the canonical slot on `claudewho use <name>`:
+
+- `claudewho use <next>` stashes the current canonical token under the
+  previously active profile, then restores `<next>`'s stash into the
+  canonical slot.
+- If `<next>` has no stash yet, the canonical entry is cleared so the next
+  IDE login is fresh.
+- `claudewho remove <name>` deletes the per-profile stash.
+- `claudewho keychain status` shows which slots are populated.
+
+Tokens never leave the Keychain. The first time claudewho touches the
+canonical entry, macOS may prompt for access — click **Always Allow**.
+
+**Run `claudewho use <name>` before launching VS Code** to choose which
+account the IDE extension uses for the session.
+
+#### Auto-fill the IDE slot from a CLI credential (suffix bindings)
+
+If you've already logged in to both accounts via the CLI, you have two
+`Claude Code-credentials-<8hex>` Keychain entries. Tell claudewho which
+suffix belongs to which profile, and `claudewho use <name>` will copy
+that entry's token into the IDE slot automatically — no need to log in
+again from the IDE.
+
+```bash
+claudewho keychain status               # see which suffixes exist
+claudewho keychain bind personal 2a2a2f1a
+claudewho keychain bind work     67e870d6
+claudewho use personal                  # IDE slot now has personal's token
+```
+
+If a profile has no binding yet, `claudewho use` falls back to the older
+per-profile stash mechanism (a separate Keychain entry claudewho
+maintains itself).
+
+Linux and Windows are unaffected: credentials there live in
+`$CLAUDE_CONFIG_DIR/.credentials.json` and are already isolated by profile.
 
 ## Requirements
 

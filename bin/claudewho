@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.4.0"
 CONFIG_FILE="${CLAUDEWHO_CONFIG:-$HOME/.claudewho.conf}"
 CONFIG_DIR_PREFIX="$HOME/.claudewho-"
 WRAPPER_DIR="$HOME/.local/bin"
 CURRENT_ACCOUNT_FILE="$HOME/.claudewho-current-account"
+KEYCHAIN_MAP_FILE="$HOME/.claudewho-keychain.map"
 
 # Colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -118,7 +119,10 @@ create_ide_wrapper() {
 CURRENT_ACCOUNT_FILE="$HOME/.claudewho-current-account"
 CONFIG_DIR_PREFIX="$HOME/.claudewho-"
 
-if [[ -f "$CURRENT_ACCOUNT_FILE" ]]; then
+# Only follow the current-account file if a parent hasn't already set
+# CLAUDE_CONFIG_DIR (e.g. via `claudewho-<name>`). Otherwise we'd stomp
+# the explicit per-account choice.
+if [[ -z "${CLAUDE_CONFIG_DIR:-}" && -f "$CURRENT_ACCOUNT_FILE" ]]; then
     account=$(cat "$CURRENT_ACCOUNT_FILE" 2>/dev/null)
     if [[ -n "$account" ]]; then
         export CLAUDE_CONFIG_DIR="${CONFIG_DIR_PREFIX}${account}"
@@ -166,6 +170,383 @@ get_current_account() {
         cat "$CURRENT_ACCOUNT_FILE" 2>/dev/null || true
     fi
 }
+
+# ----- Keychain integration (macOS, IDE / Desktop Claude Code) -------------
+# The Claude **CLI** (v2.1.x) stores credentials per account under
+# `Claude Code-credentials-<8hex>` and disambiguates them by the active
+# profile's `.claude.json` accountUuid. CLI multi-account therefore works
+# natively, once each profile has been logged in once — claudewho's only
+# job for the CLI is to set CLAUDE_CONFIG_DIR via the wrappers.
+#
+# The suffix-less `Claude Code-credentials` entry is used by the Claude
+# **Desktop app / IDE extension** (e.g. the VSCode "claude-code" extension).
+# That side has no native multi-account support, so claudewho swaps
+# per-profile stashes (service: `Claude Code-credentials-<name>`) into the
+# canonical slot on `claudewho use <name>`. Tokens never leave the Keychain.
+#
+# Verified empirically; see diagnostics/keychain-experiment/.
+
+KEYCHAIN_SERVICE="Claude Code-credentials"
+
+is_macos() {
+    [[ "$(uname)" == "Darwin" ]]
+}
+
+# Read the password from a Keychain entry by service name.
+keychain_read_password() {
+    local service="$1"
+    security find-generic-password -w -s "$service" 2>/dev/null || true
+}
+
+# Detect the "account" string stored in a Keychain entry.
+# `security find-generic-password` prints lines like:   "acct"<blob>="user@example.com"
+# The value we want is the second-to-last quoted field on that line.
+keychain_detect_account() {
+    local service="$1"
+    security find-generic-password -s "$service" 2>/dev/null \
+        | awk -F'"' '/"acct"<blob>=/{print $(NF-1); exit}'
+}
+
+# Whether the canonical Claude Code Keychain entry exists.
+# Uses metadata lookup only (no -w), so it does not prompt for ACL access.
+keychain_canonical_exists() {
+    is_macos || return 1
+    security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1
+}
+
+# Stash the current canonical token under a per-profile slot.
+# Returns 0 if stashed, 1 if nothing to stash.
+keychain_stash_canonical_as() {
+    local profile="$1"
+    is_macos || return 1
+
+    local token
+    token=$(keychain_read_password "$KEYCHAIN_SERVICE")
+    [[ -z "$token" ]] && return 1
+
+    local account
+    account=$(keychain_detect_account "$KEYCHAIN_SERVICE")
+    [[ -z "$account" ]] && account="claudewho-${profile}"
+
+    security add-generic-password -U \
+        -s "${KEYCHAIN_SERVICE}-${profile}" \
+        -a "$account" \
+        -w "$token" 2>/dev/null
+}
+
+# Restore a per-profile stash into the canonical slot.
+# Returns 0 on success, 1 if no stash exists for that profile.
+keychain_restore_to_canonical() {
+    local profile="$1"
+    is_macos || return 1
+
+    local token
+    token=$(keychain_read_password "${KEYCHAIN_SERVICE}-${profile}")
+    [[ -z "$token" ]] && return 1
+
+    local account
+    account=$(keychain_detect_account "${KEYCHAIN_SERVICE}-${profile}")
+    [[ -z "$account" ]] && account="claudewho-${profile}"
+
+    security add-generic-password -U \
+        -s "$KEYCHAIN_SERVICE" \
+        -a "$account" \
+        -w "$token" 2>/dev/null
+}
+
+# Delete the canonical Keychain entry (forces re-login on next claude run).
+keychain_clear_canonical() {
+    is_macos || return 0
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
+}
+
+# Delete a per-profile stash.
+keychain_delete_profile() {
+    local profile="$1"
+    is_macos || return 0
+    security delete-generic-password -s "${KEYCHAIN_SERVICE}-${profile}" 2>/dev/null || true
+}
+
+# Check whether a per-profile stash exists.
+keychain_profile_exists() {
+    local profile="$1"
+    is_macos || return 1
+    security find-generic-password -s "${KEYCHAIN_SERVICE}-${profile}" >/dev/null 2>&1
+}
+
+# --- Suffix bindings (profile -> 8-hex suffix of a CLI keychain entry) ---
+# Persisted in $KEYCHAIN_MAP_FILE, one line per profile: profile=suffix
+# These let `claudewho use <name>` copy the right CLI-owned credential
+# (Claude Code-credentials-<suffix>) into the suffix-less canonical slot
+# that the Desktop/IDE Claude Code reads, so the user doesn't have to log
+# in twice (once for CLI, once for IDE).
+
+keychain_get_binding() {
+    local profile="$1"
+    [[ -f "$KEYCHAIN_MAP_FILE" ]] || return 1
+    local suffix
+    suffix=$(grep -E "^${profile}=" "$KEYCHAIN_MAP_FILE" 2>/dev/null | cut -d= -f2- | head -n1)
+    [[ -z "$suffix" ]] && return 1
+    printf '%s' "$suffix"
+}
+
+keychain_set_binding() {
+    local profile="$1"
+    local suffix="$2"
+    touch "$KEYCHAIN_MAP_FILE"
+    local tmp
+    tmp=$(mktemp)
+    grep -vE "^${profile}=" "$KEYCHAIN_MAP_FILE" 2>/dev/null > "$tmp" || true
+    echo "${profile}=${suffix}" >> "$tmp"
+    mv "$tmp" "$KEYCHAIN_MAP_FILE"
+}
+
+keychain_remove_binding() {
+    local profile="$1"
+    [[ -f "$KEYCHAIN_MAP_FILE" ]] || return 0
+    local tmp
+    tmp=$(mktemp)
+    grep -vE "^${profile}=" "$KEYCHAIN_MAP_FILE" > "$tmp" || true
+    mv "$tmp" "$KEYCHAIN_MAP_FILE"
+}
+
+# Copy the bound suffixed entry into the canonical (IDE) slot.
+# Returns 0 on success, 1 if no binding or no source entry.
+keychain_apply_binding() {
+    local profile="$1"
+    is_macos || return 1
+
+    local suffix
+    suffix=$(keychain_get_binding "$profile") || return 1
+
+    local src="Claude Code-credentials-${suffix}"
+    local token
+    token=$(keychain_read_password "$src")
+    [[ -z "$token" ]] && return 1
+
+    local account
+    account=$(keychain_detect_account "$src")
+    [[ -z "$account" ]] && account="$USER"
+
+    security add-generic-password -U \
+        -s "$KEYCHAIN_SERVICE" \
+        -a "$account" \
+        -w "$token" 2>/dev/null
+}
+
+# Swap canonical (IDE/Desktop) credentials when switching from prev to next.
+# Always stashes the previous canonical first, then prefers `next`'s suffix
+# binding if set, else falls back to restoring `next`'s legacy stash.
+keychain_swap() {
+    local prev="$1"
+    local next="$2"
+
+    is_macos || return 0
+    [[ "$prev" == "$next" ]] && return 0
+
+    # Preserve whatever's in the canonical slot under prev's stash.
+    # Harmless if canonical is empty or prev is empty.
+    if [[ -n "$prev" ]]; then
+        if keychain_stash_canonical_as "$prev"; then
+            echo -e "  ${DIM}Stashed current credentials as '${prev}'.${NC}"
+        fi
+    fi
+
+    if keychain_apply_binding "$next"; then
+        echo -e "  ${DIM}Copied '${next}' CLI credentials to IDE slot.${NC}"
+        return 0
+    fi
+
+    if keychain_restore_to_canonical "$next"; then
+        echo -e "  ${DIM}Restored saved credentials for '${next}'.${NC}"
+    else
+        keychain_clear_canonical
+        echo -e "  ${YELLOW}No saved credentials or binding for '${next}'.${NC}"
+        echo -e "  ${DIM}Hint: ${BOLD}claudewho keychain status${NC}${DIM} lists suffixed entries; bind with ${BOLD}claudewho keychain bind ${next} <suffix>${NC}${DIM}.${NC}"
+    fi
+}
+
+# Extract a JSON string value via jq, falling back to a tolerant regex
+# if jq is not installed. Returns the value on stdout, or empty.
+# Usage: json_get_string <file> <jq-path> <flat-key-name>
+# Example: json_get_string "$cj" '.oauthAccount.emailAddress' emailAddress
+json_get_string() {
+    local file="$1"
+    local jq_path="$2"
+    local flat_key="$3"
+    [[ -f "$file" ]] || return 0
+    if command -v jq >/dev/null 2>&1; then
+        jq -r "${jq_path} // empty" "$file" 2>/dev/null
+    else
+        # Look for "key":"value" in the file. Permissive whitespace.
+        grep -oE "\"${flat_key}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$file" 2>/dev/null \
+            | head -n1 \
+            | sed -E "s/.*\"${flat_key}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/"
+    fi
+}
+
+# Whether a profile has been logged in at least once.
+# Source of truth: $CLAUDE_CONFIG_DIR/.claude.json's oauthAccount.accountUuid.
+# If present, the profile knows its identity and the CLI will use the
+# matching suffixed Keychain entry on macOS (or .credentials.json elsewhere).
+account_is_authenticated() {
+    local name="$1"
+    local dir="${CONFIG_DIR_PREFIX}${name}"
+    local cj="$dir/.claude.json"
+
+    [[ -f "$cj" ]] || return 1
+
+    if is_macos; then
+        local uuid
+        uuid=$(json_get_string "$cj" '.oauthAccount.accountUuid' accountUuid)
+        [[ -n "$uuid" ]]
+    else
+        [[ -f "$dir/.credentials.json" ]]
+    fi
+}
+
+# Read the profile's email from .claude.json oauthAccount, or empty string.
+account_email() {
+    local name="$1"
+    json_get_string "${CONFIG_DIR_PREFIX}${name}/.claude.json" \
+        '.oauthAccount.emailAddress' emailAddress
+}
+
+# Print Keychain state across canonical + per-profile slots.
+keychain_status() {
+    if ! is_macos; then
+        echo "Keychain integration only applies on macOS."
+        echo "On this OS, credentials live in \$CLAUDE_CONFIG_DIR/.credentials.json."
+        return 0
+    fi
+
+    echo -e "${BOLD}Keychain status:${NC}"
+    echo ""
+
+    if keychain_canonical_exists; then
+        local canon_acct
+        canon_acct=$(keychain_detect_account "$KEYCHAIN_SERVICE")
+        echo -e "  ${BLUE}canonical${NC}                 ${GREEN}present${NC}  account=${canon_acct:-<unknown>}"
+    else
+        echo -e "  ${BLUE}canonical${NC}                 ${YELLOW}empty${NC}"
+    fi
+
+    local accounts current
+    accounts=$(get_accounts)
+    current=$(get_current_account)
+
+    if [[ -n "$accounts" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Per-profile stashes:${NC}"
+        while IFS= read -r name; do
+            local marker=""
+            [[ "$name" == "$current" ]] && marker=" ${GREEN}(current)${NC}"
+            if keychain_profile_exists "$name"; then
+                local acct
+                acct=$(keychain_detect_account "${KEYCHAIN_SERVICE}-${name}")
+                printf "    ${BLUE}%-20s${NC}   ${GREEN}present${NC}  account=%s%b\n" \
+                    "$name" "${acct:-<unknown>}" "$marker"
+            else
+                printf "    ${BLUE}%-20s${NC}   ${DIM}empty${NC}%b\n" "$name" "$marker"
+            fi
+        done <<< "$accounts"
+    fi
+
+    # CLI-owned suffixed entries (Claude Code-credentials-<8hex>)
+    echo ""
+    echo -e "  ${BOLD}CLI suffixed entries (one per Anthropic account):${NC}"
+    local suffixed
+    suffixed=$(security dump-keychain ~/Library/Keychains/login.keychain-db 2>/dev/null \
+        | grep -oE '"svce"<blob>="Claude Code-credentials-[0-9a-f]{8,}"' \
+        | sed -E 's/.*"(Claude Code-credentials-[0-9a-f]+)".*/\1/' \
+        | sort -u)
+    if [[ -z "$suffixed" ]]; then
+        echo "    (none)"
+    else
+        while IFS= read -r svc; do
+            local sfx="${svc##Claude Code-credentials-}"
+            local bound_to=""
+            if [[ -f "$KEYCHAIN_MAP_FILE" ]]; then
+                bound_to=$(grep -E "=${sfx}$" "$KEYCHAIN_MAP_FILE" | cut -d= -f1 | paste -sd, -)
+            fi
+            if [[ -n "$bound_to" ]]; then
+                printf "    ${BLUE}%-20s${NC}   bound to: %s\n" "$sfx" "$bound_to"
+            else
+                printf "    ${BLUE}%-20s${NC}   ${DIM}unbound${NC}\n" "$sfx"
+            fi
+        done <<< "$suffixed"
+    fi
+
+    # Show all bindings (even if their suffixed entry is missing)
+    if [[ -f "$KEYCHAIN_MAP_FILE" && -s "$KEYCHAIN_MAP_FILE" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Profile suffix bindings:${NC}"
+        while IFS='=' read -r profile suffix; do
+            [[ -z "$profile" ]] && continue
+            local marker=""
+            [[ "$profile" == "$current" ]] && marker=" ${GREEN}(current)${NC}"
+            local svc="Claude Code-credentials-${suffix}"
+            local presence
+            if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+                presence="${GREEN}present${NC}"
+            else
+                presence="${RED}missing${NC}"
+            fi
+            printf "    ${BLUE}%-20s${NC} → ${suffix}   (%b)%b\n" "$profile" "$presence" "$marker"
+        done < "$KEYCHAIN_MAP_FILE"
+    fi
+
+    echo ""
+    echo -e "${DIM}IDE/Desktop service: '${KEYCHAIN_SERVICE}'${NC}"
+    echo -e "${DIM}CLI per-account service: '${KEYCHAIN_SERVICE}-<8hex>'${NC}"
+    echo -e "${DIM}claudewho per-profile stash: '${KEYCHAIN_SERVICE}-<name>'${NC}"
+    echo -e "${DIM}Suffix bindings file: ${KEYCHAIN_MAP_FILE}${NC}"
+}
+
+# Bind a profile to a CLI suffixed Keychain entry.
+keychain_bind() {
+    local profile="${1:-}"
+    local suffix="${2:-}"
+
+    if [[ -z "$profile" || -z "$suffix" ]]; then
+        echo -e "${RED}Error:${NC} Profile and suffix required"
+        echo "Usage: claudewho keychain bind <profile> <suffix>"
+        echo ""
+        echo "Hint: 'claudewho keychain status' lists available suffixes."
+        exit 1
+    fi
+
+    if ! account_exists "$profile"; then
+        echo -e "${RED}Error:${NC} Profile '$profile' not found"
+        echo "Run 'claudewho list' to see available profiles."
+        exit 1
+    fi
+
+    if is_macos; then
+        if ! security find-generic-password -s "Claude Code-credentials-${suffix}" >/dev/null 2>&1; then
+            echo -e "${YELLOW}Warning:${NC} no Keychain entry 'Claude Code-credentials-${suffix}' found."
+            echo "The binding will be saved, but 'claudewho use ${profile}' will skip the copy"
+            echo "until that entry exists (it gets created when you log in via the CLI)."
+        fi
+    fi
+
+    keychain_set_binding "$profile" "$suffix"
+    echo -e "${GREEN}Bound${NC} ${BLUE}${profile}${NC} → ${suffix}"
+    echo "Next 'claudewho use ${profile}' will copy this entry into the IDE slot."
+}
+
+# Remove a profile's suffix binding.
+keychain_unbind() {
+    local profile="${1:-}"
+    if [[ -z "$profile" ]]; then
+        echo -e "${RED}Error:${NC} Profile required"
+        echo "Usage: claudewho keychain unbind <profile>"
+        exit 1
+    fi
+    keychain_remove_binding "$profile"
+    echo -e "${GREEN}Unbound${NC} ${BLUE}${profile}${NC}"
+}
+# ---------------------------------------------------------------------------
 
 # Create/update the main claude wrapper
 create_claude_wrapper() {
@@ -215,8 +596,10 @@ find_real_claude() {
     exit 1
 }
 
-# Check for current account
-if [[ -f "$CURRENT_ACCOUNT_FILE" ]]; then
+# Only follow the current-account file if a parent hasn't already set
+# CLAUDE_CONFIG_DIR (e.g. via `claudewho-<name>`). Otherwise we'd stomp
+# the explicit per-account choice.
+if [[ -z "${CLAUDE_CONFIG_DIR:-}" && -f "$CURRENT_ACCOUNT_FILE" ]]; then
     account=$(cat "$CURRENT_ACCOUNT_FILE" 2>/dev/null)
     if [[ -n "$account" ]]; then
         export CLAUDE_CONFIG_DIR="${CONFIG_DIR_PREFIX}${account}"
@@ -361,6 +744,9 @@ usage() {
     echo "    wrap <command>      Create a wrapper that runs <command> under the current account"
     echo "    ide-setup           Configure IDE integration (VSCode)"
     echo "    shell-init          Print shell aliases (alternative to wrapper scripts)"
+    echo "    keychain status     Show Keychain state (macOS)"
+    echo "    keychain bind <p> <suffix>  Bind a profile to a CLI Keychain entry (macOS)"
+    echo "    keychain unbind <p>         Remove a profile's suffix binding (macOS)"
     echo "    version             Show version information"
     echo "    help                Show this help message"
     echo ""
@@ -411,18 +797,21 @@ list_accounts() {
             marker="  "
         fi
 
+        local identity=""
         if [[ -d "$dir" ]]; then
-            # Check if authenticated by looking for credentials
-            if [[ -f "$dir/.claude.json" ]] || [[ -f "$dir/.credentials.json" ]] || [[ -f "$dir/credentials.json" ]]; then
+            if account_is_authenticated "$name"; then
                 status="${GREEN}authenticated${NC}"
+                local email
+                email=$(account_email "$name")
+                [[ -n "$email" ]] && identity=" ${DIM}${email}${NC}"
             else
-                status="${YELLOW}not authenticated${NC}"
+                status="${YELLOW}not logged in${NC}"
             fi
         else
             status="${RED}directory missing${NC}"
         fi
 
-        printf "${marker}${BLUE}%-20s${NC} %-30s (%b)\n" "$name" "$dir" "$status"
+        printf "${marker}${BLUE}%-20s${NC} %-30s (%b)%b\n" "$name" "$dir" "$status" "$identity"
     done <<< "$accounts"
 
     echo ""
@@ -532,6 +921,9 @@ remove_account() {
     remove_ide_account_wrapper "$name"
     echo -e "${GREEN}Removed${NC} ${WRAPPER_DIR}/claudewho-${name}"
 
+    # Clean up Keychain stash if any
+    keychain_delete_profile "$name"
+
     # Remove from config (create temp file without the account)
     local tmp_file
     tmp_file=$(mktemp)
@@ -567,6 +959,12 @@ use_account() {
     # Ensure wrappers exist
     create_claude_wrapper
     create_ide_wrapper
+
+    local prev
+    prev=$(get_current_account)
+
+    # Swap Keychain credentials (macOS only; no-op elsewhere)
+    keychain_swap "$prev" "$name"
 
     # Save current account
     echo "$name" > "$CURRENT_ACCOUNT_FILE"
@@ -714,6 +1112,26 @@ main() {
             ;;
         shell-init|init|aliases)
             shell_init
+            ;;
+        keychain)
+            local sub="${1:-status}"
+            shift || true
+            case "$sub" in
+                status|"")
+                    keychain_status
+                    ;;
+                bind)
+                    keychain_bind "$@"
+                    ;;
+                unbind)
+                    keychain_unbind "$@"
+                    ;;
+                *)
+                    echo -e "${RED}Error:${NC} Unknown keychain subcommand '$sub'"
+                    echo "Usage: claudewho keychain {status|bind <p> <suffix>|unbind <p>}"
+                    exit 1
+                    ;;
+            esac
             ;;
         version|-v|--version)
             echo "claudewho $VERSION"
